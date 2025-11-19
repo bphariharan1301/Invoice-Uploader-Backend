@@ -283,8 +283,9 @@ router.delete("/:id", async (req, res) => {
 
 // POST /api/invoices/:id/extract - Trigger AI extraction (now calling LLM)
 router.post("/:id/extract", async (req, res) => {
-	const client = await db.connect();
+	let client;
 	try {
+		client = await db.connect();
 		const { id } = req.params;
 
 		// 1) fetch invoice row to get file_path
@@ -292,13 +293,11 @@ router.post("/:id/extract", async (req, res) => {
 			id,
 		]);
 		if (!invRes.rows.length) {
-			client.release();
 			return res.status(404).json({ error: "Invoice not found" });
 		}
 		const invoiceRow = invRes.rows[0];
 		const filePath = invoiceRow.file_path;
 		if (!filePath) {
-			client.release();
 			return res.status(400).json({ error: "No file associated with invoice" });
 		}
 
@@ -308,30 +307,82 @@ router.post("/:id/extract", async (req, res) => {
 			: path.join(process.cwd(), filePath);
 		const llmResult = await extractInvoiceFromFile(absolutePath);
 
-		// Save raw output to DB and set appropriate status
+		// If LLM failed to produce valid JSON, save raw output and mark NEEDS_REVIEW
 		if (!llmResult.ok) {
-			// Save raw LLM output if available, mark NEEDS_REVIEW
+			// Save raw LLM output as JSONB (wrap string into object to keep JSONB)
+			const rawPayload = llmResult.raw
+				? { raw: llmResult.raw }
+				: { error: llmResult.error || "no output" };
 			await client.query(
-				`UPDATE invoices SET raw_llm_json = $1, status = 'NEEDS_REVIEW', updated_at = NOW() WHERE id = $2`,
-				[llmResult.raw || JSON.stringify({ error: llmResult.error }), id]
+				`UPDATE invoices
+         SET raw_llm_json = $1,
+             llm_model = $2,
+             status = 'NEEDS_REVIEW',
+             extraction_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $3`,
+				[rawPayload, process.env.OPENAI_MODEL || null, id]
 			);
-			client.release();
-			return res
-				.status(200)
-				.json({
-					ok: false,
-					message: "Extraction returned invalid JSON",
-					details: llmResult.error,
-					raw: llmResult.raw,
-				});
+
+			// return debug info (ok: false). In prod you might hide raw.
+			return res.status(200).json({
+				ok: false,
+				message:
+					"Extraction returned invalid JSON; invoice marked NEEDS_REVIEW",
+				details: llmResult.error,
+				raw: llmResult.raw ?? null,
+			});
 		}
 
-		const parsed = llmResult.parsed;
+		// parsed JSON from LLM
+		const parsed = llmResult.parsed || {};
 
 		// 3) Persist extracted fields transactionally
 		await client.query("BEGIN");
 
-		// Update invoice main fields and raw_llm_json
+		// sanitize / coerce values to DB-friendly types
+		const supplier_name = parsed.supplier_name ?? null;
+		const invoice_number = parsed.invoice_number ?? null;
+
+		let invoice_date = null;
+		if (parsed.invoice_date) {
+			const d = new Date(parsed.invoice_date);
+			if (!Number.isNaN(d.getTime()))
+				invoice_date = d.toISOString().slice(0, 10); // YYYY-MM-DD
+		}
+
+		const currency = parsed.currency ?? invoiceRow.currency ?? "USD";
+
+		const subtotal =
+			parsed.subtotal !== undefined && parsed.subtotal !== null
+				? parseFloat(parsed.subtotal) || 0
+				: invoiceRow.subtotal !== null
+				? Number(invoiceRow.subtotal)
+				: 0;
+
+		const total =
+			parsed.total !== undefined && parsed.total !== null
+				? parseFloat(parsed.total) || 0
+				: invoiceRow.total !== null
+				? Number(invoiceRow.total)
+				: 0;
+
+		// Prepare raw JSONB to store: prefer parsed object, but preserve raw text as fallback
+		const rawToStore =
+			typeof llmResult.raw === "string" && llmResult.raw.trim().length > 0
+				? (() => {
+						try {
+							// if raw is valid JSON string, parse it into JSONB
+							const maybe = JSON.parse(llmResult.raw);
+							return maybe;
+						} catch (e) {
+							// otherwise store parsed + raw text for debugging
+							return { parsed, raw: llmResult.raw };
+						}
+				  })()
+				: parsed;
+
+		// Update invoice (includes raw_llm_json, llm_model, extraction_at)
 		await client.query(
 			`UPDATE invoices SET
          supplier_name = $1,
@@ -341,49 +392,62 @@ router.post("/:id/extract", async (req, res) => {
          subtotal = $5,
          total = $6,
          raw_llm_json = $7,
+         llm_model = $8,
+         extraction_at = NOW(),
          status = 'EXTRACTED',
          updated_at = NOW()
-       WHERE id = $8`,
+       WHERE id = $9`,
 			[
-				parsed.supplier_name || null,
-				parsed.invoice_number || null,
-				parsed.invoice_date || null,
-				parsed.currency || "USD",
-				parsed.subtotal || 0,
-				parsed.total || 0,
-				parsed.raw_llm_json ? parsed.raw_llm_json : llmResult.raw, // redundant but safe
+				supplier_name,
+				invoice_number,
+				invoice_date,
+				currency,
+				subtotal,
+				total,
+				rawToStore,
+				process.env.OPENAI_MODEL || null,
 				id,
 			]
 		);
 
-		// Replace line items
+		// Replace line items (atomic)
 		await client.query(`DELETE FROM line_items WHERE invoice_id = $1`, [id]);
-		for (const li of parsed.line_items || []) {
+
+		const parsedItems = Array.isArray(parsed.line_items)
+			? parsed.line_items
+			: [];
+		for (const li of parsedItems) {
+			const description = li.description ?? "";
+			const quantity =
+				li.quantity !== undefined && li.quantity !== null
+					? parseFloat(li.quantity) || 0
+					: 0;
+			const unit_price =
+				li.unit_price !== undefined && li.unit_price !== null
+					? parseFloat(li.unit_price) || 0
+					: 0;
+			const line_total =
+				li.line_total !== undefined && li.line_total !== null
+					? parseFloat(li.line_total) || quantity * unit_price
+					: quantity * unit_price;
+
 			await client.query(
-				`INSERT INTO line_items (invoice_id, description, quantity, unit_price, line_total)
-         VALUES ($1, $2, $3, $4, $5)`,
-				[
-					id,
-					li.description || "",
-					li.quantity || 0,
-					li.unit_price || 0,
-					li.line_total || 0,
-				]
+				`INSERT INTO line_items (invoice_id, description, quantity, unit_price, line_total, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+				[id, description, quantity, unit_price, line_total]
 			);
 		}
 
 		await client.query("COMMIT");
 
-		// refetch updated invoice
+		// refetch updated invoice + items
 		const updated = await client.query(`SELECT * FROM invoices WHERE id = $1`, [
 			id,
 		]);
 		const items = await client.query(
-			`SELECT id, description, quantity, unit_price, line_total FROM line_items WHERE invoice_id = $1`,
+			`SELECT id, description, quantity, unit_price, line_total, created_at FROM line_items WHERE invoice_id = $1 ORDER BY id ASC`,
 			[id]
 		);
-
-		client.release();
 
 		return res.json({
 			ok: true,
@@ -393,18 +457,21 @@ router.post("/:id/extract", async (req, res) => {
 		});
 	} catch (err) {
 		try {
-			await client.query("ROLLBACK");
+			if (client) await client.query("ROLLBACK");
 		} catch (e) {
-			/* ignore */
+			/* ignore rollback errors */
 		}
-		client.release();
 		console.error("LLM extract error:", err);
-		return res
-			.status(500)
-			.json({
-				error: "Extraction failed",
-				details: err.message || String(err),
-			});
+		return res.status(500).json({
+			error: "Extraction failed",
+			details: err?.message || String(err),
+		});
+	} finally {
+		try {
+			if (client) client.release();
+		} catch (e) {
+			// ignore
+		}
 	}
 });
 

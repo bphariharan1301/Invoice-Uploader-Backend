@@ -15,6 +15,10 @@ CREATE TABLE invoices (
   subtotal DECIMAL(12, 2) DEFAULT 0.00,
   total DECIMAL(12, 2) DEFAULT 0.00,
   status VARCHAR(50) DEFAULT 'UPLOADED',
+  -- Raw LLM output and meta
+  raw_llm_json JSONB NULL,
+  llm_model VARCHAR(100) NULL,
+  extraction_at TIMESTAMP NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -36,10 +40,10 @@ CREATE INDEX idx_invoices_created_at ON invoices(created_at DESC);
 CREATE INDEX idx_line_items_invoice_id ON line_items(invoice_id);
 
 -- Insert sample data for testing
-INSERT INTO invoices (supplier_name, invoice_number, invoice_date, subtotal, total, status) 
+INSERT INTO invoices (supplier_name, invoice_number, invoice_date, subtotal, total, status, raw_llm_json, llm_model, extraction_at) 
 VALUES 
-  ('Acme Inc.', 'INV-1001', '2025-11-01', 1000.00, 1200.00, 'EXTRACTED'),
-  ('Globex Corporation', '2025-204', '2025-11-10', 380.00, 450.50, 'NEEDS_REVIEW');
+  ('Acme Inc.', 'INV-1001', '2025-11-01', 1000.00, 1200.00, 'EXTRACTED', '{}'::jsonb, 'none', NOW()),
+  ('Globex Corporation', '2025-204', '2025-11-10', 380.00, 450.50, 'NEEDS_REVIEW', NULL, NULL, NULL);
 
 INSERT INTO line_items (invoice_id, description, quantity, unit_price, line_total)
 VALUES

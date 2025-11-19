@@ -1,31 +1,159 @@
 // backend/llm.js
+// PDF-text-only extractor + Gemini (Google GenAI SDK) caller
+// Returns: { ok, parsed, raw, model, error? }
+
 const fs = require("fs");
 const path = require("path");
-const fetch = require("node-fetch"); // or use global fetch on Node 18+
 const he = require("he");
+const { PDFParse } = require("pdf-parse");
+const { GoogleGenAI } = require("@google/genai");
 
-const OPENAI_URL = "https://api.openai.com/v1/responses";
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // change if needed
+const GENAI_API_KEY = process.env.GENAI_API_KEY || process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-lite";
+
+if (!GENAI_API_KEY) {
+	console.warn("GENAI_API_KEY not set; Gemini calls will fail until set.");
+}
+
+const genAI = new GoogleGenAI({ apiKey: GENAI_API_KEY });
 
 /**
- * Call the LLM with a file (base64) and a JSON-schema-guided prompt,
- * asking the model to return a strict JSON object that matches the schema.
- *
- * Returns: { parsed: object|null, raw: string, ok: boolean, error?: string }
+ * Normalize text for LLM prompts:
+ * - remove weird control chars
+ * - collapse blank lines
+ * - trim and limit length
+ */
+function normalizeTextForLLM(raw) {
+	if (!raw) return "";
+	let s = String(raw).replace(/\r/g, "\n");
+	// strip non-printable except newline/tab
+	s = s.replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\u00FF]/g, " ");
+	s = s.replace(/\n{3,}/g, "\n\n");
+	s = s
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean)
+		.join("\n");
+	// limit length (tune for token limits)
+	const maxLen = 30000; // characters
+	if (s.length > maxLen) s = s.slice(0, maxLen) + "\n\n...[TRUNCATED]";
+	return s;
+}
+
+/**
+ * Robust text extraction from a PDF buffer using pdf-parse
+ */
+async function extractTextFromPdfBuffer(buffer) {
+	try {
+		const pdfParser = new PDFParse({
+			data: buffer,
+		});
+		const data = await pdfParser.getText();
+		// prefer data.text; fallback to empty
+		const txt = data && data.text ? String(data.text) : "";
+		return normalizeTextForLLM(txt);
+	} catch (err) {
+		console.warn("pdf-parse failed:", err?.message || err);
+		return "";
+	}
+}
+
+/**
+ * Extract textual content from filePath. Only PDF handled here.
+ * Returns { text, mime }
+ */
+async function extractTextFromFilePath(filePath) {
+	const ext = path.extname(filePath || "").toLowerCase();
+	const buffer = fs.readFileSync(filePath);
+
+	if (ext === ".pdf") {
+		const txt = await extractTextFromPdfBuffer(buffer);
+		return { text: txt, mime: "application/pdf" };
+	}
+
+	// For non-PDFs we simply return stringified buffer (not used per your request)
+	try {
+		return {
+			text: normalizeTextForLLM(buffer.toString("utf8")),
+			mime: "text/plain",
+		};
+	} catch (e) {
+		return { text: "", mime: "application/octet-stream" };
+	}
+}
+
+/**
+ * Robustly extract textual output from GenAI SDK responses.
+ * SDK response shapes vary; this tries a few common ones.
+ */
+function extractTextFromGenAIResponse(res) {
+	try {
+		// candidates => candidate.content.parts[].text
+		if (res?.candidates && Array.isArray(res.candidates) && res.candidates[0]) {
+			const cand = res.candidates[0];
+			const parts = (cand.content && cand.content.parts) || cand.content;
+			if (Array.isArray(parts)) {
+				return parts.map((p) => p.text ?? JSON.stringify(p)).join("\n");
+			}
+			return JSON.stringify(cand);
+		}
+
+		// direct output array
+		if (Array.isArray(res?.output)) {
+			return res.output
+				.map((o) => (typeof o === "string" ? o : JSON.stringify(o)))
+				.join("\n");
+		}
+
+		// output_text convenience property (SDK)
+		if (typeof res?.output_text === "string" && res.output_text.trim()) {
+			return res.output_text;
+		}
+
+		// content.parts top-level
+		if (res?.content && Array.isArray(res.content)) {
+			return res.content
+				.map((c) => (c.text ? c.text : JSON.stringify(c)))
+				.join("\n");
+		}
+
+		// fallback stringify
+		if (typeof res === "string") return res;
+		return JSON.stringify(res);
+	} catch (e) {
+		return JSON.stringify(res);
+	}
+}
+
+/**
+ * Main: extractInvoiceFromFile(filePath)
+ * - extracts PDF text
+ * - prompts Gemini with the extracted text and a strict JSON schema instruction
+ * - returns parsed object or error/debug info
  */
 async function extractInvoiceFromFile(filePath) {
 	try {
-		const ext = path.extname(filePath).toLowerCase();
-		const buf = fs.readFileSync(filePath);
-		const b64 = buf.toString("base64");
+		if (!GENAI_API_KEY) {
+			throw new Error("GENAI_API_KEY environment variable not set");
+		}
 
-		// Basic mime detection
-		let mime = "application/octet-stream";
-		if (ext === ".png") mime = "image/png";
-		else if (ext === ".jpg" || ext === ".jpeg") mime = "image/jpeg";
-		else if (ext === ".pdf") mime = "application/pdf";
+		if (!filePath || !fs.existsSync(filePath)) {
+			return { ok: false, error: "filePath missing or not found", raw: null };
+		}
 
-		// JSON schema we expect the model to return
+		const { text: extractedText, mime } = await extractTextFromFilePath(
+			filePath
+		);
+
+		if (!extractedText || extractedText.trim().length === 0) {
+			return {
+				ok: false,
+				error: "No usable text extracted from PDF",
+				raw: null,
+			};
+		}
+
+		// Schema we want back
 		const schema = {
 			invoice_number: "string|null",
 			invoice_date: "YYYY-MM-DD|null",
@@ -45,113 +173,77 @@ async function extractInvoiceFromFile(filePath) {
 			],
 		};
 
-		// Instruction prompt. Be strict: ask for ONLY JSON.
-		const prompt = `
-You are an invoice extraction engine. I will provide a file encoded in base64.
+		// Build strict prompt: ONLY JSON
+		const promptText = `
+You are an invoice extraction engine. I will provide the extracted text content from an invoice (PDF text).
 Return ONLY a JSON object (no prose) that strictly matches the schema described below.
-If a field is not present, return null. Provide numeric values as numbers, date in YYYY-MM-DD.
+If a field is not present, return null. Numeric values must be numbers, date in YYYY-MM-DD.
 Provide a "confidence" (0.0-1.0) for the overall extraction, and optional confidences for each line item.
 
 Schema:
 ${JSON.stringify(schema, null, 2)}
 
-Now, the file MIME type is: ${mime}
-The file content is base64: (BEGIN_BASE64)${b64}(END_BASE64)
+MIME type of original file: ${mime}
 
-Produce the JSON output now.
-`;
+BEGIN_EXTRACTED_TEXT:
+${extractedText}
+END_EXTRACTED_TEXT
 
-		const body = {
-			model: MODEL,
-			// Simple text input. If your model supports image attachments natively, replace accordingly.
-			input: prompt,
-			// limit tokens to protect cost if you like:
-			// max_tokens: 2000
+Return only the JSON now (no explanation).
+`.trim();
+
+		// Build GenAI payload
+		const payload = {
+			model: GEMINI_MODEL,
+			contents: [
+				{
+					parts: [
+						{
+							text: promptText,
+						},
+					],
+				},
+			],
+			// Optionally add parameters like temperature, safetySettings, maxOutputTokens etc.
 		};
 
-		const res = await fetch(OPENAI_URL, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-			},
-			body: JSON.stringify(body),
-		});
+		// Call Gemini via SDK
+		const res = await genAI.models.generateContent(payload);
 
-		if (!res.ok) {
-			const text = await res.text();
-			return {
-				ok: false,
-				error: `LLM call failed: ${res.status} ${text}`,
-				raw: text,
-			};
-		}
+		// Get text
+		const rawOutput = he.decode(extractTextFromGenAIResponse(res));
 
-		const json = await res.json();
-		// response format may vary by API; try to extract text from the model output
-		// For the Responses API, 'output' may have array items; we'll robustly search.
-		let rawOutput = "";
-
-		if (json.output) {
-			// collect textual parts
-			const gather = (arr) =>
-				arr
-					.map((it) => {
-						if (typeof it === "string") return it;
-						if (it && typeof it === "object" && it.content) return it.content;
-						return JSON.stringify(it);
-					})
-					.join("\n");
-			rawOutput = Array.isArray(json.output)
-				? gather(json.output)
-				: JSON.stringify(json.output);
-		} else if (
-			json.choices &&
-			Array.isArray(json.choices) &&
-			json.choices[0].message
-		) {
-			rawOutput =
-				json.choices[0].message.content ||
-				JSON.stringify(json.choices[0].message);
-		} else {
-			rawOutput = JSON.stringify(json);
-		}
-
-		// decode HTML entities just in case
-		rawOutput = he.decode(rawOutput);
-
-		// Extract JSON from rawOutput: try to find the first {...} block
+		// Search for first JSON object
 		const firstJsonMatch = rawOutput.match(/{[\s\S]*}/);
-		let parsed = null;
-		if (firstJsonMatch) {
-			try {
-				parsed = JSON.parse(firstJsonMatch[0]);
-			} catch (parseErr) {
-				// not valid JSON; leave parsed null
-				return {
-					ok: false,
-					error: "LLM returned non-JSON or malformed JSON",
-					raw: rawOutput,
-				};
-			}
-		} else {
+		if (!firstJsonMatch) {
 			return {
 				ok: false,
-				error: "No JSON found in LLM output",
+				error: "No JSON found in model output",
 				raw: rawOutput,
 			};
 		}
 
-		// Basic sanitization / coercion
+		let parsed = null;
+		try {
+			parsed = JSON.parse(firstJsonMatch[0]);
+		} catch (parseErr) {
+			return {
+				ok: false,
+				error: "Model returned malformed JSON",
+				raw: rawOutput,
+			};
+		}
+
+		// Coerce numbers and normalize line items
 		if (parsed) {
-			// ensure numeric conversion
 			if (parsed.subtotal !== null && parsed.subtotal !== undefined)
 				parsed.subtotal = Number(parsed.subtotal) || 0;
 			if (parsed.total !== null && parsed.total !== undefined)
 				parsed.total = Number(parsed.total) || 0;
+
 			if (!Array.isArray(parsed.line_items)) parsed.line_items = [];
 			parsed.line_items = parsed.line_items.map((li) => ({
-				description: li.description || "",
+				description: li.description ?? "",
 				quantity: Number(li.quantity) || 0,
 				unit_price: Number(li.unit_price) || 0,
 				line_total:
@@ -161,9 +253,10 @@ Produce the JSON output now.
 			}));
 		}
 
-		return { ok: true, parsed, raw: rawOutput };
+		return { ok: true, parsed, raw: rawOutput, model: GEMINI_MODEL };
 	} catch (err) {
-		return { ok: false, error: err.message || String(err), raw: "" };
+		console.error("extractInvoiceFromFile error:", err);
+		return { ok: false, error: err?.message ?? String(err), raw: "" };
 	}
 }
 
