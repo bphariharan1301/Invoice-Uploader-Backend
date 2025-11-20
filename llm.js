@@ -178,7 +178,7 @@ async function extractInvoiceFromFile(filePath) {
 You are an invoice extraction engine. I will provide the extracted text content from an invoice (PDF text).
 Return ONLY a JSON object (no prose) that strictly matches the schema described below.
 If a field is not present, return null. Numeric values must be numbers, date in YYYY-MM-DD.
-Provide a "confidence" (0.0-1.0) for the overall extraction, and optional confidences for each line item.
+Provide a "confidence" (0.0-1.0) for the overall extraction, and optional confidences for each line item. Also, look for Invoice Number patterns in the text as well as Invoice Date patterns. The supplier name should be extracted from the header or footer if possible
 
 Schema:
 ${JSON.stringify(schema, null, 2)}

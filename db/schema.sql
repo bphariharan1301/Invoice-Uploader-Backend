@@ -21,6 +21,7 @@ CREATE TABLE invoices (
   extraction_at TIMESTAMP NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
+  confidence VARCHAR(10) DEFAULT NULL
 );
 
 -- Create line_items table

@@ -343,6 +343,7 @@ router.post("/:id/extract", async (req, res) => {
 		// sanitize / coerce values to DB-friendly types
 		const supplier_name = parsed.supplier_name ?? null;
 		const invoice_number = parsed.invoice_number ?? null;
+		const confidence = parsed.confidence ?? null;
 
 		let invoice_date = null;
 		if (parsed.invoice_date) {
@@ -395,7 +396,8 @@ router.post("/:id/extract", async (req, res) => {
          llm_model = $8,
          extraction_at = NOW(),
          status = 'EXTRACTED',
-         updated_at = NOW()
+         updated_at = NOW(),
+				 confidence = $10
        WHERE id = $9`,
 			[
 				supplier_name,
@@ -407,6 +409,7 @@ router.post("/:id/extract", async (req, res) => {
 				rawToStore,
 				process.env.OPENAI_MODEL || null,
 				id,
+				confidence,
 			]
 		);
 
