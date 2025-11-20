@@ -336,7 +336,7 @@ router.post("/:id/extract", async (req, res) => {
 
 		// parsed JSON from LLM
 		const parsed = llmResult.parsed || {};
-
+		console.log("Parsed Values are: ", parsed);
 		// 3) Persist extracted fields transactionally
 		await client.query("BEGIN");
 
@@ -351,7 +351,7 @@ router.post("/:id/extract", async (req, res) => {
 				invoice_date = d.toISOString().slice(0, 10); // YYYY-MM-DD
 		}
 
-		const currency = parsed.currency ?? invoiceRow.currency ?? "USD";
+		const currency = parsed.currency ?? invoiceRow.currency ?? "INR";
 
 		const subtotal =
 			parsed.subtotal !== undefined && parsed.subtotal !== null
