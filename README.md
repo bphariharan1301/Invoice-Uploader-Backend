@@ -56,11 +56,13 @@ psql -U postgres -d invoice_app -f db/schema.sql
 ### 4. Start the Server
 
 Development mode (with auto-reload):
+
 ```bash
 npm run dev
 ```
 
 Production mode:
+
 ```bash
 npm start
 ```
@@ -86,6 +88,7 @@ The server will start on `http://localhost:4000`
 ## File Upload
 
 Supports:
+
 - PDF files
 - PNG images
 - JPEG images
@@ -94,11 +97,13 @@ Supports:
 ## Database Schema
 
 ### invoices table
+
 - `id` - Primary key
 - `file_path` - Path to uploaded file
 - `supplier_name` - Supplier name
 - `invoice_number` - Invoice number
 - `invoice_date` - Invoice date
+- `confidence` - Confidence score
 - `currency` - Currency code (default: USD)
 - `subtotal` - Subtotal amount
 - `total` - Total amount
@@ -107,6 +112,7 @@ Supports:
 - `updated_at` - Last update timestamp
 
 ### line_items table
+
 - `id` - Primary key
 - `invoice_id` - Foreign key to invoices
 - `description` - Item description
@@ -128,25 +134,17 @@ All endpoints return consistent error responses:
 
 ```json
 {
-  "error": "Error message",
-  "details": "Detailed error information"
+	"error": "Error message",
+	"details": "Detailed error information"
 }
 ```
 
 ## Development
 
 The project uses:
+
 - Express.js for the web framework
 - Multer for file uploads
 - PostgreSQL with pg driver
 - CORS for cross-origin requests
 - Rate limiting for API protection
-
-## Future Enhancements
-
-- [ ] AI/LLM integration for invoice extraction
-- [ ] OCR for scanned documents
-- [ ] Authentication and authorization
-- [ ] Webhook notifications
-- [ ] Export to CSV/Excel
-- [ ] Invoice templates
